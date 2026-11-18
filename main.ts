@@ -1,7 +1,7 @@
 // GTA VI Twitch launch-day forecaster (Node 22, standard library only).
 //
-// Model v3: an ENSEMBLE of three diverse median models, averaged in log
-// space — because no single fit is trustworthy on 6-10 console curves.
+// Model v4: an ENSEMBLE of four median models, averaged in log space —
+// v3's three members plus a mega-launch anchor, and a broad-blend fade.
 //
 // A launch day's shape is set by when the game unlocks. Console-only games
 // unlock at midnight local time, rolling across timezones, so hour 1 (00:00-01:00
@@ -10,8 +10,8 @@
 // usually unlock simultaneously worldwide, so their hour 1 is already the peak
 // and their day sags instead. The console-only pool is therefore the right
 // population for GTA VI — but it is only 6 curves in a practice case (10 in the
-// final), so every per-hour fit is noisy. v3 attacks that noise three ways,
-// all validated by leave-one-out cross-validation over the console-only
+// final), so every per-hour fit is noisy. v4 attacks that noise four ways, all
+// validated by leave-one-out cross-validation over the console-only
 // comparables and by the four practice cases:
 //
 //   1. SLOPE SHRINKAGE (weight 0.45): the console fit is a Huber robust
@@ -35,17 +35,35 @@
 //      ln(v1) (scale 1.5 in log space): outside the training range its
 //      flat-level answer is not trustworthy, so authority passes back to the
 //      regression members.
+//   4. MEGA-LAUNCH ANCHOR (weight 0.40, faded in): ELDEN RING's own curve —
+//      the only mega-launch in the data (hour-1 875,155, evening 0.895x).
+//      Its weight is ZERO inside the training range and fades in
+//      exponentially once ln(p1) passes the console pool's largest ln(v1)
+//      (scale 1.0), so it only speaks where the other members extrapolate.
 //
-// The combined median is the weighted log-average of the three members; the
+// The combined median is the weighted log-average of the members; the
 // log spread is the root-mean-square of the members' spreads (each
 // max(0.10*sqrt(h-1), residual sd) * 0.85), scaled by 0.90 — the ensemble
 // median is more accurate than any member, so its honest spread is narrower.
 // The five quantiles are median * exp(z_tau * spread) with
 // z = -1.645, -0.674, 0, 0.674, 1.645. Validated locally (practice truths from
 // SullyGnome, the source the kit documents): practice mean pinball-log loss
-// 0.164 vs the v2 model's 0.172 and the house baseline's 0.387; console-only
-// LOO loss 0.139 (n=6) and 0.149 (n=10 on the final-like pool) vs v2's
-// 0.165 / 0.166. The LOO gain is broad-based (5 of 6 folds, 8 of 10 folds).
+// 0.164 vs the v3 model's 0.164 and the house baseline's 0.387; console-only
+// LOO loss 0.138 (n=6) and 0.148 (n=10 on the final-like pool) vs v3's
+// 0.139 / 0.149. The LOO gains are small (~0.001, noise-level); v4's real
+// gain is the mega-launch tail: the evening (h20) median ratio at an
+// hour-1 print of 875k is 0.87x (v3: 0.75x, ELDEN RING anchor: 0.90x),
+// 0.74x at 2M (v3: 0.49x), 0.65x at 5M (v3: 0.31x) — no collapse.
+//
+// v4's second change: the BROAD BLEND FADES out of range. The broad pool is
+// dominated by simultaneous-unlock PC launches whose days sag, so blending
+// toward it drags a mega console launch's evening down. The blend weight of
+// members 1 and 2 decays exponentially once ln(p1) passes the console pool's
+// largest ln(v1) (scale 1.5), handing authority back to the console-only
+// fit where the final lives. Inside the training range the fade is exactly
+// 1, so in-range behaviour is v3's, except for the one LOO fold (The Last of
+// Us Part II, the largest target) that tests extrapolation at all — which
+// the anchor + fade improve (0.105 -> 0.098).
 //
 // Fallbacks, per hour: if fewer than 3 console-only comparables have that hour,
 // fit on all comparables instead; if that also fails, use the house baseline's
@@ -89,6 +107,12 @@ const BLEND_MIN_V1 = 10000;
 const W_SHRINK = 0.45;
 const W_KERNEL = 0.25;
 const W_KNN = 0.30;
+/** Weight of the ELDEN RING anchor member once fully faded in. */
+const W_ELDEN = 0.4;
+/** Scale (in log space) of the broad-blend fade above the pool's largest ln(v1). */
+const BLEND_FADE_TAU = 1.5;
+/** Scale (in log space) of the ELDEN RING anchor's fade-in above the pool's largest ln(v1). */
+const ELDEN_FADE_TAU = 1.0;
 /** How much of the per-hour slope survives shrinkage toward the pooled slope. */
 const SLOPE_KEEP = 0.3;
 /** Blend weight of the slope-shrunk member toward the broad-pool fit. */
@@ -113,6 +137,8 @@ interface Case {
 }
 
 interface ComparableCurve {
+  /** Comparable name (used only to find the ELDEN RING anchor curve). */
+  name: string;
   /** ln(hour-1 viewers). */
   logV1: number;
   /** hour -> ln(viewers_h / viewers_1), for the hours present. */
@@ -177,7 +203,7 @@ function extractCurve(comp: Case['comparables'][number]): ComparableCurve | null
     const v = byHour.get(new Date(dayStart + (h - 1) * 3600e3).toISOString().slice(0, 19) + 'Z');
     if (v !== undefined && v > 0) logRatios.set(h, Math.log(v / v1));
   }
-  return { logV1: Math.log(v1), logRatios };
+  return { name: comp.name ?? '', logV1: Math.log(v1), logRatios };
 }
 
 /** Ordinary least squares of ys on xs (optionally weighted). Returns intercept,
@@ -315,9 +341,20 @@ for (const file of inputs) {
   // The pooled slope: the per-hour slopes averaged, weighted by curve count.
   const present = hourFits.filter((f): f is HourFit => f !== null);
   const pooledSlope = present.reduce((s, f) => s + f.fit.b * f.n, 0) / present.reduce((s, f) => s + f.n, 0);
-  // The console pool's largest ln(v1): the kNN fade's anchor.
+  // The console pool's largest ln(v1): the fade anchor for kNN, the broad
+  // blend and the ELDEN RING member. All three fades are keyed to how far
+  // ln(p1) sits above the training range.
   const maxLogV1 = consoleCurves.reduce((m, cc) => Math.max(m, cc.logV1), -Infinity);
-  const knnFade = Math.exp(-Math.max(0, x1 - maxLogV1) / KNN_FADE_TAU);
+  const over = Math.max(0, x1 - maxLogV1);
+  const knnFade = Math.exp(-over / KNN_FADE_TAU);
+  // The broad blend fades out of range: the broad pool is dominated by
+  // simultaneous-unlock PC launches, which drag a mega console launch's
+  // evening down. Inside the range the fade is exactly 1.
+  const blendDecay = Number.isFinite(maxLogV1) ? Math.exp(-over / BLEND_FADE_TAU) : 0;
+  // The ELDEN RING anchor: the only mega-launch curve in the data. Its
+  // weight is zero inside the range and fades in out of range.
+  const eldenCurve = curves.find((cc) => /elden ring/i.test(cc.name));
+  const wElden = W_ELDEN * (Number.isFinite(maxLogV1) ? 1 - Math.exp(-over / ELDEN_FADE_TAU) : 1);
 
   const hours = c.forecast.map(({ hour: h }) => {
     const pool = consoleCurves.filter((cc) => cc.logRatios.has(h)).length >= MIN_FIT ? consoleCurves : curves;
@@ -333,7 +370,7 @@ for (const file of inputs) {
       const mx = hf.xs.reduce((s, x) => s + x, 0) / hf.xs.length;
       const a = hf.fit.a + (hf.fit.b - b) * mx;
       let pred = a + b * x1;
-      pred = blendBroad(pred, x1, curves, h, SHRINK_BLEND);
+      pred = blendBroad(pred, x1, curves, h, SHRINK_BLEND * blendDecay);
       mShrink = { med: pred, spread: spreadOf(hf.fit, h) };
     }
 
@@ -348,7 +385,7 @@ for (const file of inputs) {
       const ess = kw.reduce((s, w) => s + w, 0) ** 2 / kw.reduce((s, w) => s + w * w, 0);
       const fit = ess < 3 ? clampSlope(huber(xs, ys), xs) : clampSlope(huber(xs, ys, kw), xs);
       let pred = fit.a + fit.b * x1;
-      pred = blendBroad(pred, x1, curves, h, BLEND_WEIGHT);
+      pred = blendBroad(pred, x1, curves, h, BLEND_WEIGHT * blendDecay);
       mKernel = { med: pred, spread: spreadOf(fit, h) };
     }
 
@@ -371,13 +408,26 @@ for (const file of inputs) {
       mKnn = { med, spread: Math.max(SPREAD_FLOOR * Math.sqrt(h - 1), sd) * SPREAD_SCALE };
     }
 
-    // Ensemble: log-average of the medians (kNN weight faded out of range),
-    // RMS of the spreads, scaled by ENSEMBLE_SPREAD_SCALE.
+    // Member 4: the ELDEN RING anchor — the mega-launch curve's own
+    // per-hour log-ratios applied to p1. Zero weight inside the range.
+    let mElden: MemberResult;
+    if (eldenCurve === undefined || !eldenCurve.logRatios.has(h)) {
+      mElden = baselineRow(p1, h);
+    } else {
+      mElden = {
+        med: x1 + (eldenCurve.logRatios.get(h) as number),
+        spread: Math.max(SPREAD_FLOOR * Math.sqrt(h - 1), 0.25) * SPREAD_SCALE,
+      };
+    }
+
+    // Ensemble: log-average of the medians (kNN weight faded out of range,
+    // ELDEN weight faded in), RMS of the spreads, scaled by
+    // ENSEMBLE_SPREAD_SCALE.
     const wKnn = W_KNN * knnFade;
-    const wSum = W_SHRINK + W_KERNEL + wKnn;
-    const med = (W_SHRINK * mShrink.med + W_KERNEL * mKernel.med + wKnn * mKnn.med) / wSum;
+    const wSum = W_SHRINK + W_KERNEL + wKnn + wElden;
+    const med = (W_SHRINK * mShrink.med + W_KERNEL * mKernel.med + wKnn * mKnn.med + wElden * mElden.med) / wSum;
     const spread = Math.sqrt(
-      (W_SHRINK * mShrink.spread ** 2 + W_KERNEL * mKernel.spread ** 2 + wKnn * mKnn.spread ** 2) / wSum
+      (W_SHRINK * mShrink.spread ** 2 + W_KERNEL * mKernel.spread ** 2 + wKnn * mKnn.spread ** 2 + wElden * mElden.spread ** 2) / wSum
     ) * ENSEMBLE_SPREAD_SCALE;
     const q = Z.map((z) => round2(Math.max(1, Math.exp(med + z * spread))));
     for (let j = 1; j < q.length; j++) q[j] = Math.max(q[j], q[j - 1]);
