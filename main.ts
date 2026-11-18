@@ -90,6 +90,28 @@ function extractCurve(comp: Case['comparables'][number]): ComparableCurve | null
   }
   const dayStart = Date.parse(comp.day_start);
   if (Number.isNaN(dayStart)) return null;
+  // Decontamination: a launch whose pre-release peak already exceeds its
+  // release-day peak was playable before its day_start (early access), so its
+  // "release day" curve is not a clean launch-day shape — drop it. Only
+  // apply when both sides are well sampled (sparse SullyGnome history could
+  // otherwise misfire): at least 5 points in the 14 days before day_start
+  // and at least 12 points on the release day; otherwise keep the comparable.
+  let preMax = 0;
+  let preN = 0;
+  let dayMax = 0;
+  let dayN = 0;
+  for (const [from, viewers] of byHour) {
+    const t = Date.parse(from);
+    if (Number.isNaN(t)) continue;
+    if (t >= dayStart - 14 * 86400e3 && t < dayStart) {
+      preN++;
+      if (viewers > preMax) preMax = viewers;
+    } else if (t >= dayStart && t < dayStart + 24 * 3600e3) {
+      dayN++;
+      if (viewers > dayMax) dayMax = viewers;
+    }
+  }
+  if (preN >= 5 && dayN >= 12 && preMax > dayMax) return null;
   const v1 = byHour.get(new Date(dayStart).toISOString().slice(0, 19) + 'Z');
   if (v1 === undefined || v1 <= 0) return null;
   const logRatios = new Map<number, number>();
