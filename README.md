@@ -16,7 +16,7 @@ A launch day's shape is set by when the game unlocks. Console-only games unlock 
 
 For each hour h = 2..24 it fits, over those comparables, `ln(viewers_h) = a_h + b_h * ln(viewers_1)` by ordinary least squares. The fitted slope runs from ~1.0 in the early hours down to ~0.7 in the evening: a bigger hour-1 print means a proportionally smaller evening peak. The median forecast is `exp(a_h + b_h * ln(p1))` where p1 is the case's hour-1 print. The log spread is the regression's residual standard deviation, floored by 0.15·√(h−1), then scaled by 0.85; the five quantiles are median · exp(z_tau · spread).
 
-Local results (practice truths read from SullyGnome, the source the kit documents): mean pinball-log loss **0.202** over the four practice cases (Wolverine 0.335, Red Dead Redemption 2 0.183, God of War Ragnarök 0.121, Spider-Man 2 0.170), against the house baseline's **0.387**. Leave-one-out cross-validation over the console-only comparables: **0.172** vs the baseline's 0.323.
+Local results (practice truths read from SullyGnome, the source the kit documents): mean pinball-log loss **0.193** over the four practice cases (Wolverine 0.308, Red Dead Redemption 2 0.173, God of War Ragnarök 0.119, Spider-Man 2 0.172), against the house baseline's **0.387**. Leave-one-out cross-validation over the console-only comparables: **0.192** (n=6) vs the baseline's 0.323.
 
 ## Run
 
